@@ -1,0 +1,73 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 50  # Tần số cập nhật điều khiển
+
+    diff_cont:
+      type: diff_drive_controller/DiffDriveController
+
+    joint_broad:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    imu_sensor_controller:
+      type: imu_sensor_broadcaster/IMUSensorBroadcaster  # Thêm IMU sensor
+
+diff_cont:
+  ros__parameters:
+    
+    publish_rate: 50.0  # Tốc độ xuất dữ liệu
+
+    base_frame_id: base_link
+    enable_odom_tf: true
+    left_wheel_names: ['left_wheel_joint_front', 'left_wheel_joint_rear']
+    right_wheel_names: ['right_wheel_joint_front', 'right_wheel_joint_rear']
+    wheel_separation: 0.24  # Khoảng cách giữa 2 bánh xe (m)
+    wheel_radius: 0.05  # Bán kính bánh xe (m)
+
+    # Tăng độ chính xác tính toán quán tính
+    wheel_separation_multiplier: 1.02
+    left_wheel_radius_multiplier: 1.0
+    right_wheel_radius_multiplier: 1.0
+
+    # 4 bánh xe chủ động (4WD)
+    wheels_per_side: 2  
+
+    # Cấu hình bộ lọc tín hiệu (giảm nhiễu khi di chuyển)
+    cmd_vel_timeout: 0.5
+    use_stamped_vel: false # Không dùng velocity có dấu thời gian
+
+    odom_frame_id: "odom"
+    pose_covariance_diagonal: [0.001, 0.001, 0.001, 0.01, 0.01, 0.01]
+    twist_covariance_diagonal: [0.001, 0.001, 0.001, 0.01, 0.01, 0.01]
+
+imu_sensor_controller:
+  ros__parameters:
+    sensor_name: imu_sensor
+    frame_id: imu_link
+    publish_rate: 10.0  # Tốc độ xuất dữ liệu của IMU
+    imu_topic: "/imu/data"
+
+    # open_loop: false    
+
+    # odom_frame_id: odom
+    # pose_covariance_diagonal: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+    # twist_covariance_diagonal: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+    # enable_odom_tf: true
+
+    # cmd_vel_timeout: 0.5  # Ngắt tín hiệu nếu không nhận lệnh trong 0.5s
+    # publish_limited_velocity: true
+    # velocity_rolling_window_size: 5
+
+    # # Giới hạn tốc độ nếu cần
+    # linear.x.has_velocity_limits: true
+    # linear.x.max_velocity: 2.0  # m/s
+    # linear.x.min_velocity: -2.0 # m/s
+    # linear.x.has_acceleration_limits: true
+    # linear.x.max_acceleration: 1.0 # m/s²
+    # linear.x.min_acceleration: -1.0 # m/s²
+
+    # angular.z.has_velocity_limits: true
+    # angular.z.max_velocity: 1.5  # rad/s
+    # angular.z.min_velocity: -1.5 # rad/s
+    # angular.z.has_acceleration_limits: true
+    # angular.z.max_acceleration: 0.75 # rad/s²
+    # angular.z.min_acceleration: -0.75 # rad/s²

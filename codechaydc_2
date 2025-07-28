@@ -1,0 +1,465 @@
+import rclpy
+from rclpy.node import Node
+from visualization_msgs.msg import Marker
+from std_msgs.msg import Header
+from sensor_msgs.msg import LaserScan
+from my_package.msg import Yolov8Inference
+from geometry_msgs.msg import PointStamped, PoseStamped, Twist, Point, Quaternion
+from nav2_simple_commander.robot_navigator import BasicNavigator
+import math
+import numpy as np
+from rclpy.duration import Duration
+import tf2_ros
+from tf2_geometry_msgs.tf2_geometry_msgs import do_transform_point
+from tf_transformations import euler_from_quaternion, quaternion_from_euler
+import time
+
+class KalmanFilter:
+    def __init__(self):
+        self.x = np.zeros((4, 1))  # [x, y, vx, vy]
+        self.P = np.eye(4) * 1.0
+        self.F = np.array([[1, 0, 1, 0],
+                           [0, 1, 0, 1],
+                           [0, 0, 1, 0],
+                           [0, 0, 0, 1]])
+        self.H = np.array([[1, 0, 0, 0],
+                           [0, 1, 0, 0]])
+        self.R = np.eye(2) * 0.1
+        self.Q = np.eye(4) * 0.4
+        self.I = np.eye(4)
+        self.initialized = False
+        self.last_update_time = None
+
+    def predict(self):
+        if not self.initialized:
+            return 0.0, 0.0, 0.0, 0.0
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+        return self.x[0, 0], self.x[1, 0], self.x[2, 0], self.x[3, 0]
+
+    def update(self, z, current_time):
+        self.initialized = True
+        self.last_update_time = current_time
+        y = z - self.H @ self.x
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        self.P = (self.I - K @ self.H) @ self.P
+
+    def reset(self):
+        self.x = np.zeros((4, 1))
+        self.P = np.eye(4) * 1.0
+        self.initialized = False
+        self.last_update_time = None
+
+class MarkerPublisher(Node):
+    def __init__(self):
+        super().__init__('marker_publisher')
+
+        self.publisher = self.create_publisher(Marker, 'visualization_marker', 10)
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.create_subscription(Yolov8Inference, '/Yolov8_Inference', self.yolo_callback, 10)
+        self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
+
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        self.detections = []
+        self.last_yolo_detection = None
+        self.last_yolo_time = None
+        self.scan_data = None
+        self.timer = self.create_timer(0.05, self.timer_callback)
+        self.active_marker_ids = set()
+
+        self.image_width = 640
+        self.camera_fov_deg = 66.13
+        self.camera_frame = 'camera_link'
+
+        self.navigator = BasicNavigator()
+        self.last_sent_goal = None
+
+        self.kf = KalmanFilter()
+        self.rate = self.create_rate(10)
+
+        self.last_odom_time = None
+        self.odom_stuck_count = 0
+        self.last_yolo_check = None
+        self.yolo_silent_count = 0
+
+    def yolo_callback(self, msg):
+        current_time = self.get_clock().now()
+        self.last_yolo_check = current_time
+        self.yolo_silent_count = 0
+
+        num_objects = len(msg.yolov8_inference)
+        self.get_logger().info(f"Nhận {num_objects} object từ YOLO")
+        self.detections = []
+        for det in msg.yolov8_inference:
+            if det.class_name == "person":
+                center_x = (det.left + det.right) / 2.0
+                # Tính góc offset (nếu cần hiển thị log)
+                angle_offset = -((center_x - self.image_width / 2.0) / (self.image_width / 2.0)) * (self.camera_fov_deg / 2.0)
+                det_data = {
+                    "label": det.class_name,
+                    "distance": det.distance,
+                    "center_x": center_x
+                }
+                self.detections.append(det_data)
+                self.last_yolo_detection = det_data
+                self.last_yolo_time = current_time
+                self.get_logger().info(f"Phát hiện người: khoảng cách {det.distance:.2f}m, center_x {center_x:.2f}, góc {angle_offset:.1f}°")
+                x, y = self.get_position_from_yolo(det_data)
+                if x is not None and y is not None:
+                    z = np.array([[x], [y]])
+                    self.kf.update(z, current_time)
+                    self.get_logger().info(f"Tọa độ người: x={x:.2f}, y={y:.2f}")
+                else:
+                    self.get_logger().warn("Không lấy được tọa độ người từ YOLO")
+
+    def scan_callback(self, msg):
+        self.scan_data = msg
+
+    def get_position_from_yolo(self, detection):
+        distance = detection["distance"]
+        center_x = detection["center_x"]
+
+        if distance <= 0:
+            self.get_logger().warn("Khoảng cách YOLO không hợp lệ")
+            return None, None
+
+        angle_offset_rad = - ((center_x - self.image_width / 2.0) / (self.image_width / 2.0)) * math.radians(self.camera_fov_deg / 2.0)
+        x = distance * math.cos(angle_offset_rad)
+        y = distance * math.sin(angle_offset_rad)
+
+        point_cam = PointStamped()
+        point_cam.header.stamp = self.get_clock().now().to_msg()
+        point_cam.header.frame_id = self.camera_frame
+        point_cam.point.x = x
+        point_cam.point.y = y
+        point_cam.point.z = 0.0
+
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                'map', self.camera_frame, rclpy.time.Time(), timeout=Duration(seconds=0.5)
+            )
+            point_map = do_transform_point(point_cam, transform)
+            return point_map.point.x, point_map.point.y
+        except Exception as e:
+            self.get_logger().warn(f"Không thể transform từ {self.camera_frame} sang map: {e}")
+            return None, None
+
+    def get_robot_position(self):
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                'map', 'base_link', rclpy.time.Time(), timeout=Duration(seconds=0.5)
+            )
+            translation = transform.transform.translation
+            self.get_logger().debug(f"Vị trí robot: x={translation.x:.2f}, y={translation.y:.2f}")
+            return translation.x, translation.y
+        except Exception as e:
+            self.get_logger().warn(f"Không thể lấy pose robot từ TF: {e}")
+            return None, None
+
+    def get_robot_orientation(self):
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                'map', 'base_link', rclpy.time.Time(), timeout=Duration(seconds=0.5)
+            )
+            rotation = transform.transform.rotation
+            _, _, yaw = euler_from_quaternion([rotation.x, rotation.y, rotation.z, rotation.w])
+            self.get_logger().debug(f"Hướng robot: {math.degrees(yaw):.2f}°")
+            self.last_odom_time = self.get_clock().now()
+            self.odom_stuck_count = 0
+            return yaw
+        except Exception as e:
+            self.get_logger().warn(f"Không thể lấy hướng robot từ TF: {e}")
+            return None
+
+    def normalize_angle(self, angle):
+        while angle > math.pi:
+            angle -= 2 * math.pi
+        while angle < -math.pi:
+            angle += 2 * math.pi
+        return angle
+
+    def timer_callback(self):
+        current_ids = set()
+        now = self.get_clock().now()
+
+        if self.detections:
+            # Lọc chỉ các phát hiện là người
+            people_detections = [d for d in self.detections if d.get("label") == "person"]
+            if people_detections:
+                closest_det = min(people_detections, key=lambda d: d.get("distance", float("inf")))
+                world_x, world_y = self.get_position_from_yolo(closest_det)
+                if world_x is not None and world_y is not None:
+                    self.kf.update(np.array([[world_x], [world_y]]), now)
+                    self.kf.last_update_time = now
+                    self.kf.initialized = True
+
+            for i, det in enumerate(self.detections):
+                world_x, world_y = self.get_position_from_yolo(det)
+                if world_x is None or world_y is None:
+                    continue
+
+                self.publish_marker(i, world_x, world_y, det)
+                current_ids.add(i)
+
+                robot_pos = self.get_robot_position()
+                if robot_pos is None:
+                    continue
+                robot_x, robot_y = robot_pos
+
+                dx = world_x - robot_x
+                dy = world_y - robot_y
+                distance = det.get('distance', math.sqrt(dx ** 2 + dy ** 2))
+                if not math.isfinite(distance):
+                    self.get_logger().warn("Khoảng cách không hợp lệ!")
+                    continue
+
+                desired_distance = 2.5
+                tolerance = 0.3
+
+                if distance < desired_distance - tolerance or distance > desired_distance + tolerance:
+                    unit_dx = dx / distance
+                    unit_dy = dy / distance
+                    target_x = world_x - unit_dx * desired_distance
+                    target_y = world_y - unit_dy * desired_distance
+
+                    goal = self.build_goal(target_x, target_y)
+                    if self.last_sent_goal is None or self._distance(goal, self.last_sent_goal) > 0.2:
+                        self.get_logger().info(
+                            f"Gửi goal đến ({target_x:.2f}, {target_y:.2f}) để giữ khoảng cách {desired_distance}m"
+                        )
+                        self.navigator.goToPose(goal)
+                        self.last_sent_goal = goal
+                else:
+                    self.get_logger().info(
+                        f"Giữ nguyên vị trí – đã ở đúng khoảng cách {distance:.2f}m"
+                    )
+        else:
+            # Không có phát hiện từ YOLO – sử dụng dữ liệu Kalman nếu có
+            if self.kf.initialized and self.kf.last_update_time:
+                dt = (now - self.kf.last_update_time).nanoseconds / 1e9
+                if dt < 5.0:  # Cho phép dùng dữ liệu Kalman tới 5s
+                    pred_x, pred_y, _, _ = self.kf.predict()
+                    robot_pos = self.get_robot_position()
+                    if robot_pos is not None:
+                        robot_x, robot_y = robot_pos
+                        dx = pred_x - robot_x
+                        dy = pred_y - robot_y
+                        distance = math.sqrt(dx ** 2 + dy ** 2)
+                        if not math.isfinite(distance):
+                            self.get_logger().warn("Dự đoán Kalman không hợp lệ!")
+                            return
+                        desired_distance = 2.5
+                        tolerance = 0.3
+                        if distance < desired_distance - tolerance or distance > desired_distance + tolerance:
+                            unit_dx = dx / distance
+                            unit_dy = dy / distance
+                            target_x = pred_x - unit_dx * desired_distance
+                            target_y = pred_y - unit_dy * desired_distance
+                            goal = self.build_goal(target_x, target_y)
+                            if self.last_sent_goal is None or self._distance(goal, self.last_sent_goal) > 0.2:
+                                self.get_logger().warn(f"[YOLO mất] Gửi goal dựa trên Kalman: ({target_x:.2f}, {target_y:.2f})")
+                                self.navigator.goToPose(goal)
+                                self.last_sent_goal = goal
+                        else:
+                            self.get_logger().info(f"[YOLO mất] Vẫn giữ vị trí – khoảng cách theo Kalman: {distance:.2f}m")
+                    else:
+                        self.get_logger().warn("Không lấy được vị trí robot để theo Kalman.")
+                else:
+                    # Nếu dữ liệu Kalman quá cũ (>5s), cho robot xoay để tìm người\n                    pred_x, pred_y, _, _ = self.kf.predict()\n                    robot_pos = self.get_robot_position()\n                    if robot_pos is not None:\n                        robot_x, robot_y = robot_pos\n                        dx = pred_x - robot_x\n                        dy = pred_y - robot_y\n                        angle = math.atan2(dy, dx)\n                        # Chuyển từ quaternion -> yaw không cần thiết vì angle đã là yaw\n                        goal = self.build_goal(robot_x, robot_y, angle)\n                        if self.last_sent_goal is None or self._angle_difference(goal, self.last_sent_goal) > 0.2:\n                            self.get_logger().warn(\"[YOLO mất >5s] Quay tìm người theo Kalman\")\n                            self.navigator.goToPose(goal)\n                            self.last_sent_goal = goal\n                    else:\n                        self.get_logger().warn(\"Không lấy được vị trí robot để quay theo Kalman.\")\n            else:\n                self.get_logger().debug(\"Không có dữ liệu Kalman để dự đoán.\")\n\n        # Luôn dọn các marker không còn hợp lệ\n        self.cleanup_old_markers(current_ids)\n"
+                    self.get_logger().info("Timer callback đã chạy xong.")
+        
+    def get_last_seen_angle(self):
+        if self.last_yolo_detection is None:
+            return None
+        center_x = self.last_yolo_detection["center_x"]
+        angle_offset_rad = - ((center_x - self.image_width / 2.0) / (self.image_width / 2.0)) * math.radians(self.camera_fov_deg / 2.0)
+        return angle_offset_rad
+
+    def rotate_toward_angle(self, target_angle, found_person_check_fn=None):
+        if not hasattr(self, 'cmd_vel_pub'):
+            self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        target_angle = self.normalize_angle(target_angle)
+        tolerance = math.radians(5)
+        angular_speed = 0.5
+        r = self.create_rate(20, self.get_clock())
+        max_rotate_duration = 10
+        start_time = time.time()
+        twist = Twist()
+        twist.linear.x = 0.0
+        self.get_logger().info(f"Bắt đầu xoay về góc {math.degrees(target_angle):.1f}°")
+        yaw_stuck_count = 0
+        max_yaw_stuck = 30
+        last_yaw = None
+        while rclpy.ok():
+            if found_person_check_fn and found_person_check_fn():
+                self.get_logger().info("YOLO phát hiện lại người – hủy xoay.")
+                break
+            robot_yaw = self.get_robot_orientation()
+            if robot_yaw is None:
+                self.get_logger().warn("Không lấy được góc robot khi xoay.")
+                r.sleep()
+                continue
+            if last_yaw is not None and abs(last_yaw - robot_yaw) < 0.01:
+                yaw_stuck_count += 1
+                self.get_logger().warn(f"Robot không xoay, yaw không đổi ({yaw_stuck_count}/{max_yaw_stuck}).")
+                if yaw_stuck_count >= max_yaw_stuck:
+                    self.get_logger().error("Yaw kẹt quá lâu – dừng xoay để an toàn.")
+                    break
+            else:
+                yaw_stuck_count = 0
+            last_yaw = robot_yaw
+            angle_diff = self.normalize_angle(target_angle - robot_yaw)
+            self.get_logger().info(f"[Rotate] robot_yaw: {math.degrees(robot_yaw):.1f}°, target: {math.degrees(target_angle):.1f}°, diff: {math.degrees(angle_diff):.1f}°")
+            if abs(angle_diff) < tolerance:
+                self.get_logger().info("Đạt được góc mục tiêu.")
+                break
+            twist.angular.z = angular_speed if angle_diff > 0 else -angular_speed
+            self.cmd_vel_pub.publish(twist)
+            r.sleep()
+            if time.time() - start_time > max_rotate_duration:
+                self.get_logger().warn("Xoay quá lâu – dừng để tránh kẹt.")
+                break
+        twist.angular.z = 0.0
+        self.cmd_vel_pub.publish(twist)
+        self.get_logger().info("Hoàn thành xoay.")
+
+    def publish_marker(self, marker_id, x, y, det):
+        marker = Marker()
+        marker.header = Header()
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.header.frame_id = "map"
+        marker.ns = "detections"
+        marker.id = marker_id
+        marker.type = Marker.TEXT_VIEW_FACING
+        marker.action = Marker.ADD
+        marker.pose.position.x = float(x)
+        marker.pose.position.y = float(y)
+        marker.pose.position.z = 0.2
+        marker.scale.z = 0.2
+        label_text = f"{det['label']}"
+        distance_text = f"{det['distance']:.2f}m"
+        marker.text = f"{label_text}:{distance_text}"
+        marker.color.r = 1.0
+        marker.color.g = 0.0
+        marker.color.b = 0.0
+        marker.color.a = 1.0
+        marker.lifetime = Duration(seconds=2).to_msg()
+        self.publisher.publish(marker)
+        self.active_marker_ids.add(marker_id)
+        circle = Marker()
+        circle.header = marker.header
+        circle.ns = "detections"
+        circle.id = marker_id + 1000
+        circle.type = Marker.LINE_STRIP
+        circle.action = Marker.ADD
+        circle.pose.orientation.w = 1.0
+        circle.scale.x = 0.03
+        circle.color.r = 0.0
+        circle.color.g = 0.5
+        circle.color.b = 1.0
+        circle.color.a = 1.0
+        circle.lifetime = Duration(seconds=2).to_msg()
+        radius = 0.6
+        num_points = 70
+        for i in range(num_points + 1):
+            angle = 2 * math.pi * i / num_points
+            px = x + radius * math.cos(angle)
+            py = y + radius * math.sin(angle)
+            p = Point(x=px, y=py, z=0.05)
+            circle.points.append(p)
+        self.publisher.publish(circle)
+
+    def build_goal(self, x, y, yaw=None):
+        goal = PoseStamped()
+        goal.header.frame_id = 'map'
+        goal.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.position.x = float(x)
+        goal.pose.position.y = float(y)
+        goal.pose.position.z = 0.0
+        if yaw is not None:
+            q = quaternion_from_euler(0.0, 0.0, yaw)
+            goal.pose.orientation.x = q[0]
+            goal.pose.orientation.y = q[1]
+            goal.pose.orientation.z = q[2]
+            goal.pose.orientation.w = q[3]
+        else:
+            goal.pose.orientation.w = 1.0
+        return goal
+
+    def cleanup_old_markers(self, current_ids):
+        for old_id in self.active_marker_ids - current_ids:
+            for marker_id in [old_id, old_id + 1000]:
+                delete_marker = Marker()
+                delete_marker.header.stamp = self.get_clock().now().to_msg()
+                delete_marker.header.frame_id = "map"
+                delete_marker.ns = "detections"
+                delete_marker.id = marker_id
+                delete_marker.action = Marker.DELETE
+                self.publisher.publish(delete_marker)
+        self.active_marker_ids = current_ids
+
+    def _distance(self, goal1, goal2):
+        dx = goal1.pose.position.x - goal2.pose.position.x
+        dy = goal1.pose.position.y - goal2.pose.position.y
+        return math.sqrt(dx ** 2 + dy ** 2)
+
+    def yaw_to_quaternion(self, yaw):
+        q = quaternion_from_euler(0, 0, yaw)
+        return Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
+
+    def quaternion_to_yaw(self, quat):
+        _, _, yaw = euler_from_quaternion([quat.x, quat.y, quat.z, quat.w])
+        return yaw
+
+    def _angle_difference(self, goal1, goal2):
+        q1 = [
+            goal1.pose.orientation.x,
+            goal1.pose.orientation.y,
+            goal1.pose.orientation.z,
+            goal1.pose.orientation.w
+        ]
+        q2 = [
+            goal2.pose.orientation.x,
+            goal2.pose.orientation.y,
+            goal2.pose.orientation.z,
+            goal2.pose.orientation.w
+        ]
+        _, _, yaw1 = euler_from_quaternion(q1)
+        _, _, yaw2 = euler_from_quaternion(q2)
+        return abs((yaw1 - yaw2 + math.pi) % (2 * math.pi) - math.pi)
+
+    def get_last_seen_angle(self):
+        if self.last_yolo_detection is None:
+            return None
+        center_x = self.last_yolo_detection["center_x"]
+        angle_offset_rad = - ((center_x - self.image_width / 2.0) / (self.image_width / 2.0)) * math.radians(self.camera_fov_deg / 2.0)
+        return angle_offset_rad
+
+    def get_robot_yaw(self):
+        try:
+            transform = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time(), timeout=Duration(seconds=0.5))
+            rot = transform.transform.rotation
+            _, _, yaw = euler_from_quaternion([rot.x, rot.y, rot.z, rot.w])
+            return yaw
+        except Exception as e:
+            self.get_logger().warn(f"Không thể lấy yaw robot từ TF: {e}")
+            return None
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = MarkerPublisher()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+

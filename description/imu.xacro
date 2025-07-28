@@ -1,0 +1,48 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+    <!-- Link IMU -->
+    <link name="imu_link">
+        <visual>
+            <geometry>
+                <box size="0.01 0.01 0.005"/>  <!-- Kích thước mô hình IMU -->
+            </geometry>
+            <material name="blue"/>
+        </visual>
+        <collision>
+            <geometry>
+                <box size="0.01 0.01 0.005"/>
+            </geometry>
+        </collision>
+        <inertial>
+            <mass value="0.01"/>
+            <origin xyz="0 0 0"/>
+            <inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/>
+        </inertial>
+    </link>
+
+    <!-- Joint cố định IMU vào robot -->
+    <joint name="imu_joint" type="fixed">
+        <parent link="chassis"/>
+        <child link="imu_link"/>
+        <origin xyz="0.1 0 0.075" rpy="0 0 0"/>  <!-- Vị trí IMU trên robot -->
+    </joint>
+
+    <!-- Plugin IMU cho Gazebo -->
+    <gazebo reference="imu_link">
+        <material>Gazebo/Blue</material>
+
+        <sensor name="imu_sensor" type="imu">
+            <pose>0 0 0 0 0 0</pose>
+            <always_on>true</always_on>
+            <update_rate>10</update_rate>  <!-- Cập nhật dữ liệu IMU 50Hz -->
+            <imu>
+                <topic>imu/data</topic>
+                <orientation>true</orientation>
+                <angular_velocity>true</angular_velocity>
+                <linear_acceleration>true</linear_acceleration>
+            </imu>
+        </sensor>
+    </gazebo>
+
+</robot>
